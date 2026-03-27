@@ -3,6 +3,7 @@ import multer from 'multer'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import fs from 'fs/promises'
+import { GoogleGenerativeAI } from '@google/generative-ai'
 import Resume from '../models/Resume.js'
 import AnalysisResult from '../models/AnalysisResult.js'
 import SkillExtracted from '../models/SkillExtracted.js'
@@ -17,11 +18,11 @@ const router = express.Router()
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
-// Ensure uploads directory exists
+// ─── Uploads directory ────────────────────────────────────────────────────────
 const uploadsDir = join(__dirname, '../uploads')
 fs.mkdir(uploadsDir, { recursive: true }).catch(console.error)
 
-// Configure multer for file uploads
+// ─── Multer config ────────────────────────────────────────────────────────────
 const storage = multer.diskStorage({
   destination: async (req, file, cb) => {
     cb(null, uploadsDir)
@@ -34,9 +35,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage: storage,
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
-  },
+  limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowedTypes = [
       'application/pdf',
@@ -51,11 +50,57 @@ const upload = multer({
   }
 })
 
-// Analyze resume endpoint
+// ─── AI-based resume/CV validator ─────────────────────────────────────────────
+// Sends the first ~1500 characters of extracted text to Gemini and asks it to
+// decide whether the document is a resume or CV.  Non-resume documents are
+// rejected before any heavy processing happens.
+async function validateIsResume(extractedText) {
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
+
+  const snippet = extractedText.substring(0, 1500)
+
+  const prompt = `You are a document classifier. 
+Your ONLY job is to decide whether the text below is from a resume or CV (curriculum vitae).
+
+A resume/CV typically contains some of these elements:
+- Candidate name and contact details (email, phone, LinkedIn, location)
+- Work experience or professional history
+- Education section (degrees, institutions, dates)
+- Skills section (technical skills, tools, languages)
+- Certifications, projects, or achievements
+
+Reply with ONLY one of these two words — nothing else:
+  RESUME   (if the document is a resume or CV)
+  NOT_RESUME  (if the document is anything else, such as a cover letter, academic paper, report, invoice, article, etc.)
+
+Document text:
+"""
+${snippet}
+"""`
+
+  const result = await model.generateContent(prompt)
+  const verdict = result.response.text().trim().toUpperCase()
+
+  // Accept any response that starts with "RESUME" (guards against stray punctuation)
+  return verdict.startsWith('RESUME')
+}
+
+// ─── Helper: clean up uploaded file ──────────────────────────────────────────
+async function cleanupFile(filePath) {
+  if (!filePath) return
+  try {
+    await fs.unlink(filePath)
+  } catch (err) {
+    console.error('Error deleting file:', err)
+  }
+}
+
+// ─── POST /analyze ────────────────────────────────────────────────────────────
 router.post('/analyze', authenticate, upload.single('resume'), async (req, res) => {
   const startTime = Date.now()
   let resume = null
-  
+
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' })
@@ -63,14 +108,14 @@ router.post('/analyze', authenticate, upload.single('resume'), async (req, res) 
 
     console.log(`[${new Date().toISOString()}] Starting analysis for user ${req.user._id}`)
 
-    // Extract text from resume (with timeout)
-    console.log(`[${new Date().toISOString()}] Extracting text from file: ${req.file.originalname} (${req.file.size} bytes)`)
-    
+    // ── Step 1: Extract text ──────────────────────────────────────────────────
+    console.log(`[${new Date().toISOString()}] Extracting text from: ${req.file.originalname} (${req.file.size} bytes)`)
+
     const extractPromise = extractTextFromResume(req.file.path, req.file.mimetype)
-    const extractTimeout = new Promise((_, reject) => 
+    const extractTimeout = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('Text extraction timeout after 15 seconds')), 15000)
     )
-    
+
     let resumeText
     try {
       resumeText = await Promise.race([extractPromise, extractTimeout])
@@ -78,39 +123,57 @@ router.post('/analyze', authenticate, upload.single('resume'), async (req, res) 
       console.error(`[${new Date().toISOString()}] Text extraction failed:`, extractError.message)
       throw extractError
     }
-    
-    // Validate extracted text quality
+
+    // Basic text quality checks
     if (!resumeText || resumeText.trim().length < 50) {
-      console.error(`[${new Date().toISOString()}] Insufficient text extracted: ${resumeText?.length || 0} characters`)
-      throw new Error('Could not extract sufficient text from resume. The file might be scanned (image-based) or corrupted. Please use a text-based PDF or Word document.')
+      throw new Error('Could not extract sufficient text from the document. The file might be scanned or corrupted. Please use a text-based PDF or Word document.')
     }
-    
-    // Additional validation: ensure it's not JSON/metadata
+
     const trimmedText = resumeText.trim()
     if (trimmedText.startsWith('{') || trimmedText.startsWith('[')) {
-      console.error(`[${new Date().toISOString()}] ERROR: Extracted text appears to be JSON/metadata!`)
-      console.error(`[${new Date().toISOString()}] Text preview: ${trimmedText.substring(0, 200)}`)
-      throw new Error('Text extraction failed - received metadata instead of resume content. Please try uploading a different file format or ensure your PDF contains selectable text.')
+      throw new Error('Text extraction failed — received metadata instead of document content.')
     }
-    
-    // Check word count
+
     const wordCount = resumeText.split(/\s+/).filter(w => w.length > 0).length
-    console.log(`[${new Date().toISOString()}] Successfully extracted ${resumeText.length} characters, ${wordCount} words`)
-    
     if (wordCount < 20) {
-      throw new Error('Resume contains insufficient text content. Please ensure your resume has substantial readable text.')
+      throw new Error('Document contains insufficient text. Please ensure your file has substantial readable text.')
     }
-    
-    // Log text preview for verification
+
+    console.log(`[${new Date().toISOString()}] Extracted ${resumeText.length} characters, ${wordCount} words`)
+
+    // ── Step 2: AI resume/CV validation ──────────────────────────────────────
+    console.log(`[${new Date().toISOString()}] Validating document type with AI...`)
+
+    let isResume = false
+    try {
+      isResume = await validateIsResume(resumeText)
+    } catch (validationError) {
+      // If the classification call itself fails, log and reject safely
+      console.error(`[${new Date().toISOString()}] Resume validation error:`, validationError.message)
+      await cleanupFile(req.file.path)
+      return res.status(500).json({
+        error: 'Could not validate document type. Please try again.'
+      })
+    }
+
+    if (!isResume) {
+      console.warn(`[${new Date().toISOString()}] Rejected non-resume document: ${req.file.originalname}`)
+      await cleanupFile(req.file.path)
+      return res.status(422).json({
+        error: 'The uploaded document does not appear to be a resume or CV. Please upload a valid resume or curriculum vitae.'
+      })
+    }
+
+    console.log(`[${new Date().toISOString()}] Document validated as resume/CV. Proceeding with analysis.`)
+
+    // ── Step 3: Full AI analysis ──────────────────────────────────────────────
     console.log(`[${new Date().toISOString()}] Text preview: ${resumeText.substring(0, 150).replace(/\n/g, ' ')}...`)
     console.log(`[${new Date().toISOString()}] Starting AI analysis with ${resumeText.length} characters`)
 
-    // Analyze with AI (Gemini) - this is the main bottleneck
     const analysis = await analyzeResume(resumeText)
-    
     console.log(`[${new Date().toISOString()}] AI analysis completed in ${Date.now() - startTime}ms`)
 
-    // Save to database (main resume document – now focused on file metadata)
+    // ── Step 4: Persist to database ───────────────────────────────────────────
     resume = new Resume({
       user: req.user._id,
       filename: req.file.filename,
@@ -118,17 +181,14 @@ router.post('/analyze', authenticate, upload.single('resume'), async (req, res) 
       filePath: req.file.path,
       fileSize: req.file.size,
       mimeType: req.file.mimetype,
-      // keep legacy embedded analysis for backward compatibility
       analysis: analysis
     })
-
     await resume.save()
 
-    // New normalized data tables (collections)
     const analysisResult = await AnalysisResult.create({
       resume: resume._id,
       ats_score: analysis.atsScore,
-      grammar_score: null, // not currently provided by AI
+      grammar_score: null,
       keyword_match_score: analysis.keywordScore,
       overall_score: analysis.overallScore,
       strengths: JSON.stringify(analysis.strengths || []),
@@ -136,7 +196,6 @@ router.post('/analyze', authenticate, upload.single('resume'), async (req, res) 
       suggestions: JSON.stringify(analysis.recommendations || [])
     })
 
-    // Store extracted skills as separate documents
     const skills = analysis.skills || []
     if (skills.length > 0) {
       const skillDocs = skills.map(skill => ({
@@ -148,7 +207,6 @@ router.post('/analyze', authenticate, upload.single('resume'), async (req, res) 
       await SkillExtracted.insertMany(skillDocs)
     }
 
-    // Parse structured data from resume text
     const parsedData = parseResumeData(resumeText)
     await ResumeParsedData.create({
       resume: resume._id,
@@ -161,7 +219,7 @@ router.post('/analyze', authenticate, upload.single('resume'), async (req, res) 
       project_data: parsedData.project_data.length > 0 ? parsedData.project_data : null,
       parsing_status: parsedData.parsing_status
     })
-    
+
     console.log(`[Resume Parser] Parsing status: ${parsedData.parsing_status}`)
     if (parsedData.parsing_status === 'SUCCESS') {
       console.log(`[Resume Parser] Extracted - Name: ${parsedData.full_name || 'N/A'}, Email: ${parsedData.email || 'N/A'}, Phone: ${parsedData.phone || 'N/A'}`)
@@ -181,32 +239,23 @@ router.post('/analyze', authenticate, upload.single('resume'), async (req, res) 
     })
   } catch (error) {
     console.error(`[${new Date().toISOString()}] Error processing resume:`, error.message)
-    
-    // Clean up file on error
-    if (req.file && req.file.path) {
-      try {
-        await fs.unlink(req.file.path)
-      } catch (unlinkError) {
-        console.error('Error deleting file:', unlinkError)
-      }
-    }
+    await cleanupFile(req.file?.path)
 
     const errorMessage = error.message || 'Failed to analyze resume'
-    res.status(500).json({ 
+    res.status(500).json({
       error: errorMessage,
       details: process.env.NODE_ENV === 'development' ? error.stack : undefined
     })
   }
 })
 
-// Get analysis history (optional endpoint)
+// ─── GET /history ─────────────────────────────────────────────────────────────
 router.get('/history', authenticate, async (req, res) => {
   try {
     const resumes = await Resume.find({ user: req.user._id })
       .select('originalName uploadedAt analysis.overallScore')
       .sort({ uploadedAt: -1 })
       .limit(10)
-    
     res.json({ resumes })
   } catch (error) {
     console.error('Error fetching history:', error)
@@ -214,36 +263,29 @@ router.get('/history', authenticate, async (req, res) => {
   }
 })
 
-// Get specific resume analysis
+// ─── GET /:id ─────────────────────────────────────────────────────────────────
 router.get('/:id', authenticate, async (req, res) => {
   try {
     const resume = await Resume.findOne({ _id: req.params.id, user: req.user._id })
     if (!resume) {
       return res.status(404).json({ error: 'Resume not found' })
     }
-    res.json({
-      success: true,
-      ...resume.analysis,
-      resumeId: resume._id
-    })
+    res.json({ success: true, ...resume.analysis, resumeId: resume._id })
   } catch (error) {
     console.error('Error fetching resume:', error)
     res.status(500).json({ error: 'Failed to fetch resume analysis' })
   }
 })
 
-// Download analysis report as PDF
+// ─── GET /:id/download ────────────────────────────────────────────────────────
 router.get('/:id/download', authenticate, async (req, res) => {
   try {
     const resume = await Resume.findOne({ _id: req.params.id, user: req.user._id })
       .populate('user', 'name email')
-    
     if (!resume) {
       return res.status(404).json({ error: 'Resume not found' })
     }
-    
     const pdfBuffer = await generatePDFReport(resume.analysis, resume.user)
-    
     res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', `attachment; filename="resume-analysis-${resume._id}.pdf"`)
     res.send(pdfBuffer)
@@ -254,4 +296,3 @@ router.get('/:id/download', authenticate, async (req, res) => {
 })
 
 export default router
-
